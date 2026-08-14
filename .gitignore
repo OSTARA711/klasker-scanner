@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+bench/result_*.json
+bench/error_*.log
+
+.env
+.env.*
+!.env.example
