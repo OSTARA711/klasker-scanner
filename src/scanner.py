@@ -3,16 +3,17 @@
 """
 Klasker Scanner v0.1.1
 
-Path: ~/klasker-scanner-v0.1/src/scanner.py
+Path: ~/klasker-scanner/src/scanner.py
 
 Initial website evidence extraction engine for Klasker.
 
 v0.1.1 deliberately avoids:
-- databases
 - external AI APIs
 - browser automation
 - concurrency
 - persistent queues
+
+Database persistence is handled separately by database.py.
 
 It produces one structured JSON evaluation for one website.
 
@@ -24,6 +25,7 @@ v0.1.1 adds:
 - Brand extraction
 - Organisation extraction
 - AggregateRating extraction
+- 24-hour scan result reuse
 """
 
 import json
@@ -36,6 +38,8 @@ import urllib.request
 
 
 USER_AGENT = "KlaskerScanner/0.1.1 (+https://www.klasker.com/)"
+
+SCAN_CACHE_HOURS = 24
 
 
 class HTMLMetadataParser(HTMLParser):
@@ -416,7 +420,61 @@ def main():
         return 2
 
     try:
-        result = scan(sys.argv[1])
+        url = normalise_url(sys.argv[1])
+
+        from database import get_latest_scan_metadata, get_scan, save_scan
+
+        domain = urlparse(url).netloc
+
+        previous_scan = get_latest_scan_metadata(domain)
+
+        if previous_scan is not None:
+            scanned_at = previous_scan["scanned_at"]
+
+            if hasattr(scanned_at, "timestamp"):
+                scan_age_seconds = time.time() - scanned_at.timestamp()
+
+                cache_limit_seconds = SCAN_CACHE_HOURS * 60 * 60
+
+                if scan_age_seconds < cache_limit_seconds:
+                    result = get_scan(previous_scan["id"])
+
+                    if result is not None:
+                        result["database"] = {
+                            "saved": False,
+                            "scan_id": previous_scan["id"],
+                            "cache": {
+                                "used": True,
+                                "age_seconds": round(
+                                    scan_age_seconds,
+                                    2
+                                ),
+                                "max_age_hours": SCAN_CACHE_HOURS,
+                            },
+                        }
+
+                        print(
+                            json.dumps(
+                                result,
+                                indent=2,
+                                ensure_ascii=False
+                            )
+                        )
+
+                        return 0
+
+        result = scan(url)
+
+        scan_id = save_scan(result)
+
+        result["database"] = {
+            "saved": True,
+            "scan_id": scan_id,
+            "cache": {
+                "used": False,
+                "max_age_hours": SCAN_CACHE_HOURS,
+            },
+        }
 
         print(
             json.dumps(
