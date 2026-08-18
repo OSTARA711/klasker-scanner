@@ -1,170 +1,214 @@
 #!/usr/bin/env python3
 
 """
-Klasker Scanner HTTP server.
+Klasker Scanner v0.1.1
 
-Provides a minimal authenticated HTTP interface to the scanner.
+Path: ~/klasker-scanner/src/scanner.py
 
-POST /scan
-Authorization: Bearer <secret>
+Main scanner orchestration and command-line interface.
 
-Body:
-{
-  "url": "https://example.com"
-}
+The scanner is deliberately modular:
+
+- fetcher.py   -> HTTP fetching
+- parser.py    -> HTML and JSON-LD parsing
+- analyser.py  -> scoring
+- database.py  -> TiDB persistence and cache
+
+It produces one structured JSON evaluation for one website.
 """
 
 import json
-import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import sys
+import time
+from urllib.parse import urlparse, urljoin
 
-from scanner import scan_with_cache
+from analyser import calculate_score
+from database import get_latest_scan_metadata, get_scan, save_scan
+from fetcher import fetch, fetch_optional
+from parser import HTMLMetadataParser, extract_json_ld
 
 
-HOST = "127.0.0.1"
-PORT = int(os.environ.get("KLASKER_SCANNER_PORT", "8080"))
-API_SECRET = os.environ.get("KLASKER_SCANNER_SECRET")
+SCAN_CACHE_HOURS = 24
 
 
-class ScannerHandler(BaseHTTPRequestHandler):
-    """Handle scanner HTTP requests."""
+def normalise_url(url):
+    """Normalise and validate a website URL."""
 
-    def send_json(self, status, data):
-        """Send a JSON response."""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
 
-        body = json.dumps(
-            data,
-            ensure_ascii=False,
-        ).encode("utf-8")
+    parsed = urlparse(url)
 
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            "application/json",
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(body)),
-        )
-        self.end_headers()
+    if not parsed.netloc:
+        raise ValueError("Invalid URL")
 
-        self.wfile.write(body)
+    return url
 
-    def do_POST(self):
-        """Handle POST requests."""
 
-        if self.path != "/scan":
-            self.send_json(
-                404,
-                {"error": "Not found"},
+def scan(url):
+    """Scan one website and return structured evidence."""
+
+    url = normalise_url(url)
+
+    homepage = fetch(url)
+
+    html_body = homepage["body"]
+
+    parser = HTMLMetadataParser()
+
+    try:
+        parser.feed(
+            html_body.decode(
+                "utf-8",
+                errors="replace",
             )
-            return
-
-        if not API_SECRET:
-            self.send_json(
-                500,
-                {"error": "Scanner secret is not configured"},
-            )
-            return
-
-        authorization = self.headers.get(
-            "Authorization",
-            "",
         )
 
-        expected = f"Bearer {API_SECRET}"
+    except Exception:
+        pass
 
-        if authorization != expected:
-            self.send_json(
-                401,
-                {"error": "Unauthorized"},
-            )
-            return
+    json_ld = extract_json_ld(parser.json_ld)
 
-        content_length = self.headers.get(
-            "Content-Length",
-        )
+    base_url = homepage["url"].rstrip("/") + "/"
 
-        if not content_length:
-            self.send_json(
-                400,
-                {"error": "Request body is required"},
-            )
-            return
+    robots_url = urljoin(base_url, "robots.txt")
+    llms_url = urljoin(base_url, "llms.txt")
+    sitemap_url = urljoin(base_url, "sitemap.xml")
 
-        try:
-            length = int(content_length)
-            body = self.rfile.read(length)
-            payload = json.loads(body)
+    result = {
+        "scanner": {
+            "name": "Klasker Scanner",
+            "version": "0.1.1",
+        },
 
-        except (ValueError, json.JSONDecodeError):
-            self.send_json(
-                400,
-                {"error": "Invalid JSON"},
-            )
-            return
+        "target": {
+            "requested_url": url,
+            "final_url": homepage["url"],
+            "domain": urlparse(homepage["url"]).netloc,
+        },
 
-        url = payload.get("url")
+        "http": {
+            "status": homepage["status"],
+            "elapsed_ms": homepage["elapsed_ms"],
+            "size_bytes": len(html_body),
+            "headers": homepage["headers"],
+        },
 
-        if not isinstance(url, str) or not url.strip():
-            self.send_json(
-                400,
-                {"error": "A URL is required"},
-            )
-            return
+        "html": {
+            "title": parser.title,
+            "description": parser.description,
+            "canonical": parser.canonical,
+            "open_graph": parser.og,
+            "json_ld": json_ld,
+        },
 
-        try:
-            result = scan_with_cache(url.strip())
+        "discovery": {
+            "robots": fetch_optional(robots_url),
+            "llms": fetch_optional(llms_url),
+            "sitemap": fetch_optional(sitemap_url),
+        },
+    }
 
-            self.send_json(
-                200,
-                result,
-            )
+    result["score"] = calculate_score(result)
 
-        except Exception as exc:
-            self.send_json(
-                500,
-                {"error": str(exc)},
-            )
+    return result
 
-    def do_GET(self):
-        """Reject GET requests."""
 
-        self.send_json(
-            405,
-            {"error": "Method not allowed"},
-        )
+def scan_with_cache(url):
+    """Return a cached result when available, otherwise scan and save."""
 
-    def log_message(self, format, *args):
-        """Keep the default access log concise."""
+    url = normalise_url(url)
 
-        print(
-            f"{self.address_string()} - {format % args}"
-        )
+    domain = urlparse(url).netloc
+
+    previous_scan = get_latest_scan_metadata(domain)
+
+    if previous_scan is not None:
+        scanned_at = previous_scan["scanned_at"]
+
+        if hasattr(scanned_at, "timestamp"):
+            scan_age_seconds = time.time() - scanned_at.timestamp()
+
+            cache_limit_seconds = SCAN_CACHE_HOURS * 60 * 60
+
+            if scan_age_seconds < cache_limit_seconds:
+                result = get_scan(previous_scan["id"])
+
+                if result is not None:
+                    result["database"] = {
+                        "saved": False,
+                        "scan_id": previous_scan["id"],
+                        "cache": {
+                            "used": True,
+                            "age_seconds": round(
+                                scan_age_seconds,
+                                2,
+                            ),
+                            "max_age_hours": SCAN_CACHE_HOURS,
+                        },
+                    }
+
+                    return result
+
+    result = scan(url)
+
+    scan_id = save_scan(result)
+
+    result["database"] = {
+        "saved": True,
+        "scan_id": scan_id,
+        "cache": {
+            "used": False,
+            "max_age_hours": SCAN_CACHE_HOURS,
+        },
+    }
+
+    return result
 
 
 def main():
-    """Start the HTTP server."""
+    """Run the command-line scanner."""
 
-    server = HTTPServer(
-        (HOST, PORT),
-        ScannerHandler,
-    )
+    if len(sys.argv) != 2:
+        print(
+            "Usage: scanner.py <URL>",
+            file=sys.stderr,
+        )
 
-    print(
-        f"Klasker Scanner HTTP server listening on "
-        f"{HOST}:{PORT}"
-    )
+        return 2
 
     try:
-        server.serve_forever()
+        result = scan_with_cache(sys.argv[1])
 
-    except KeyboardInterrupt:
-        print("\nStopping scanner server.")
+        print(
+            json.dumps(
+                result,
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
 
-    finally:
-        server.server_close()
+    except Exception as exc:
+        error = {
+            "scanner": {
+                "name": "Klasker Scanner",
+                "version": "0.1.1",
+            },
+            "error": str(exc),
+        }
+
+        print(
+            json.dumps(
+                error,
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
